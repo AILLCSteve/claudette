@@ -12,7 +12,7 @@ export async function POST(request: Request) {
 
   const { data: project } = await supabase
     .from('projects')
-    .select('*')
+    .select('*, tasks(*), obstacles(*), session_logs(*)')
     .eq('id', projectId)
     .single()
 
@@ -25,7 +25,37 @@ export async function POST(request: Request) {
   const [owner, repo] = project.github_repo.split('/')
   if (!owner || !repo) return NextResponse.json({ error: 'Invalid github_repo format (expected owner/repo)' }, { status: 400 })
 
-  const content = generateMarkerFile(project)
+  // Get the repo's default branch so we can link to the correct blob URL
+  let defaultBranch = 'main'
+  try {
+    const { data: repoData } = await octokit.repos.get({ owner, repo })
+    defaultBranch = repoData.default_branch ?? 'main'
+  } catch {
+    // non-fatal — fall back to 'main'
+  }
+
+  // Get the user's first API token to embed in the marker file
+  const { data: tokens } = await supabase
+    .from('api_tokens')
+    .select('token')
+    .eq('user_id', user.id)
+    .order('created_at', { ascending: false })
+    .limit(1)
+
+  const claudetteToken = tokens?.[0]?.token ?? ''
+  const appUrl = process.env.NEXT_PUBLIC_APP_URL
+    ?? request.headers.get('origin')
+    ?? ''
+
+  const content = generateMarkerFile({
+    ...project,
+    claudette_url: appUrl,
+    claudette_token: claudetteToken,
+    tasks: project.tasks ?? [],
+    obstacles: project.obstacles ?? [],
+    session_logs: project.session_logs ?? [],
+  })
+
   const encoded = Buffer.from(content).toString('base64')
 
   // Check if file already exists so we can update (requires SHA)
@@ -37,7 +67,7 @@ export async function POST(request: Request) {
     // File doesn't exist yet — that's fine
   }
 
-  const { data } = await octokit.repos.createOrUpdateFileContents({
+  await octokit.repos.createOrUpdateFileContents({
     owner,
     repo,
     path: '.claudepm.md',
@@ -50,7 +80,7 @@ export async function POST(request: Request) {
 
   return NextResponse.json({
     success: true,
-    url: `https://github.com/${owner}/${repo}/blob/${data.content?.name ?? 'main'}/.claudepm.md`,
+    url: `https://github.com/${owner}/${repo}/blob/${defaultBranch}/.claudepm.md`,
     action: existingSha ? 'updated' : 'created',
   })
 }

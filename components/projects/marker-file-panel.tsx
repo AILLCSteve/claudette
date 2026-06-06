@@ -1,23 +1,13 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { Copy, Check, Upload, RefreshCw, GitBranch, ExternalLink } from 'lucide-react'
-import { generateMarkerFile } from '@/lib/pm/marker-parser'
+import { generateMarkerFile, type RichProject } from '@/lib/pm/marker-parser'
 
 interface Props {
-  project: {
-    id: string
-    name: string
-    description?: string
-    stack?: string[]
-    health?: string
-    agent_assigned?: string
-    sprint_goal?: string
-    local_path?: string
-    github_repo?: string
-  }
+  project: RichProject
 }
 
 export function MarkerFilePanel({ project }: Props) {
@@ -27,9 +17,30 @@ export function MarkerFilePanel({ project }: Props) {
   const [importResult, setImportResult] = useState('')
   const [showImport, setShowImport] = useState(false)
   const [pushing, setPushing] = useState(false)
-  const [pushResult, setPushResult] = useState<{ url?: string; action?: string; error?: string } | null>(null)
+  const [pushResult, setPushResult] = useState<{ url?: string; action?: string; error?: string; needsGithubAuth?: boolean } | null>(null)
+  const [githubConnecting, setGithubConnecting] = useState(false)
+  const [appUrl, setAppUrl] = useState('')
+  const [claudetteToken, setClaudetteToken] = useState('')
 
-  const markerContent = generateMarkerFile(project)
+  useEffect(() => {
+    setAppUrl(window.location.origin)
+    // Check if any tokens exist — we show a placeholder in the display
+    // (actual token is embedded server-side when pushing to GitHub)
+    fetch('/api/tokens')
+      .then(r => r.json())
+      .then(data => {
+        if (Array.isArray(data) && data.length > 0) setClaudetteToken('cldt_your_token_here')
+      })
+      .catch(() => {})
+  }, [])
+
+  const richProject: RichProject = {
+    ...project,
+    claudette_url: appUrl || undefined,
+    claudette_token: claudetteToken || undefined,
+  }
+
+  const markerContent = generateMarkerFile(richProject)
 
   const copy = async () => {
     await navigator.clipboard.writeText(markerContent)
@@ -47,13 +58,30 @@ export function MarkerFilePanel({ project }: Props) {
         body: JSON.stringify({ projectId: project.id }),
       })
       const data = await res.json()
-      if (!res.ok) setPushResult({ error: data.error })
-      else setPushResult({ url: data.url, action: data.action })
+      if (!res.ok) {
+        const needsGithubAuth = res.status === 401 && data.error?.toLowerCase().includes('github')
+        setPushResult({ error: data.error, needsGithubAuth })
+      } else {
+        setPushResult({ url: data.url, action: data.action })
+      }
     } catch {
       setPushResult({ error: 'Network error' })
     } finally {
       setPushing(false)
     }
+  }
+
+  const reconnectGithub = async () => {
+    setGithubConnecting(true)
+    const { createClient } = await import('@/lib/supabase/client')
+    const supabase = createClient()
+    await supabase.auth.signInWithOAuth({
+      provider: 'github',
+      options: {
+        redirectTo: `${window.location.origin}/auth/callback?next=${window.location.pathname}`,
+        scopes: 'repo read:org',
+      },
+    })
   }
 
   const handleImport = async () => {
@@ -78,12 +106,13 @@ export function MarkerFilePanel({ project }: Props) {
   }
 
   return (
-    <div className="space-y-4 max-w-2xl">
+    <div className="space-y-4 max-w-3xl">
       <div className="space-y-1">
         <h3 className="text-sm font-medium">Project Marker File</h3>
         <p className="text-xs text-muted-foreground">
-          This file tells Claude Code about the project and how to report back to Claudette.
-          Push it to your repo or run <code className="bg-secondary px-1 rounded font-mono">/pm-init</code> to generate it locally.
+          This file gives Claude Code full context about this project and how to report back to Claudette.
+          Push it to your repo or run <code className="bg-secondary px-1 rounded font-mono">/pm-init</code> locally.
+          Update it anytime with <code className="bg-secondary px-1 rounded font-mono">/pm-update</code>.
         </p>
       </div>
 
@@ -99,7 +128,7 @@ export function MarkerFilePanel({ project }: Props) {
         <Textarea
           value={markerContent}
           readOnly
-          className="font-mono text-xs h-72 resize-none pr-10 bg-secondary/50 border-border/60"
+          className="font-mono text-xs h-96 resize-none pr-10 bg-secondary/50 border-border/60"
         />
       </div>
 
@@ -142,7 +171,21 @@ export function MarkerFilePanel({ project }: Props) {
             ? 'bg-red-500/10 border border-red-500/20 text-red-400'
             : 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400'
         }`}>
-          {pushResult.error ? pushResult.error : (
+          {pushResult.error ? (
+            <>
+              <span className="flex-1">{pushResult.error}</span>
+              {pushResult.needsGithubAuth && (
+                <button
+                  onClick={reconnectGithub}
+                  disabled={githubConnecting}
+                  className="ml-auto shrink-0 flex items-center gap-1 bg-red-500/20 hover:bg-red-500/30 border border-red-500/30 rounded px-2 py-1 text-red-300 hover:text-red-200 transition-colors"
+                >
+                  {githubConnecting ? <RefreshCw className="h-3 w-3 animate-spin" /> : null}
+                  Reconnect GitHub
+                </button>
+              )}
+            </>
+          ) : (
             <>
               <Check className="h-3 w-3 shrink-0" />
               <span>File {pushResult.action} in repo</span>
