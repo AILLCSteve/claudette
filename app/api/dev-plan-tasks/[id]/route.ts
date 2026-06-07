@@ -5,7 +5,7 @@ const VALID_STATUSES = ['pending', 'in-progress', 'done', 'blocked', 'skipped']
 
 // Map dev_plan_tasks status → pm_items status
 const PM_STATUS_MAP: Record<string, string> = {
-  'pending':     'backlog',
+  'pending':     'not-started',
   'in-progress': 'in-progress',
   'done':        'done',
   'blocked':     'blocked',
@@ -35,7 +35,7 @@ export async function PATCH(request: Request, { params }: { params: { id: string
   // Verify ownership: task → dev_plan → project → user
   const { data: task } = await user.supabase
     .from('dev_plan_tasks')
-    .select('id, title, dev_plan_id')
+    .select('id, title, notes, dev_plan_id')
     .eq('id', params.id)
     .single()
 
@@ -59,6 +59,16 @@ export async function PATCH(request: Request, { params }: { params: { id: string
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
 
+  // When completing a task, stamp who completed it in notes
+  const isCompleting = body.status === 'done' || body.status === 'skipped'
+  if (isCompleting && user.email) {
+    const completedLine = `Completed by: ${user.email}${user.tokenName ? ` (${user.tokenName})` : ''} at ${new Date().toISOString()}`
+    const existingNotes: string = task.notes ?? ''
+    // Replace any previous "Completed by" line or append
+    const cleaned = existingNotes.replace(/^Completed by:.*$/m, '').trim()
+    allowed.notes = cleaned ? `${cleaned}\n${completedLine}` : completedLine
+  }
+
   const { data, error } = await user.supabase
     .from('dev_plan_tasks')
     .update({ ...allowed, updated_at: new Date().toISOString() })
@@ -71,10 +81,10 @@ export async function PATCH(request: Request, { params }: { params: { id: string
   // Propagate status change to pm_items Board view (best-effort, non-fatal).
   // Match by project_id + title + level='task' since titles are unique within a plan.
   if (body.status !== undefined) {
-    const pmStatus = PM_STATUS_MAP[body.status] ?? 'backlog'
+    const pmStatus = PM_STATUS_MAP[body.status] ?? 'not-started'
     const { data: pmItems } = await user.supabase
       .from('pm_items')
-      .select('id')
+      .select('id, assigned_agents')
       .eq('project_id', plan.project_id)
       .eq('level', 'task')
       .eq('title', task.title)
@@ -82,9 +92,22 @@ export async function PATCH(request: Request, { params }: { params: { id: string
 
     if (pmItems && pmItems.length > 0) {
       for (const pmItem of pmItems) {
+        const pmUpdate: Record<string, unknown> = {
+          status: pmStatus,
+          updated_at: new Date().toISOString(),
+        }
+
+        // On completion, assign the completing account so the board shows who did it
+        if (isCompleting && user.email) {
+          const existing: string[] = pmItem.assigned_agents ?? []
+          if (!existing.includes(user.email)) {
+            pmUpdate.assigned_agents = [...existing, user.email]
+          }
+        }
+
         await user.supabase
           .from('pm_items')
-          .update({ status: pmStatus, updated_at: new Date().toISOString() })
+          .update(pmUpdate)
           .eq('id', pmItem.id)
       }
     }
