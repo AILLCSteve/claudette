@@ -17,52 +17,71 @@ import { NextResponse } from 'next/server'
 
 const SESSION_WINDOW_TOKENS_K = 150
 
-// Grammar-constrained schema — the model CANNOT violate this structure.
-// JSON.parse() on the response is therefore guaranteed to succeed.
+// Nested hierarchy schema: tracks → features → tasks (with subtasks).
+// The AI decides the full tree shape — how many features per track, tasks per
+// feature, and subtasks per task — based on actual work complexity.
 //
-// Type choices match the DB columns in dev_plan_tasks (migration 001 + 006):
-//   estimated_tokens_k integer  → 'integer' (not 'number' — prevents 30.5-style floats)
-//   session_window integer      → 'integer'
-//   is_checkpoint boolean       → 'boolean'
-//   priority text check(...)    → 'string' + enum
-//   assigned_agent text         → 'string' + enum (constrain to defined agents)
-//
-// minItems is intentionally absent — Anthropic only allows 0 or 1.
-// Minimum task count is enforced via the prompt instead.
+// Subtasks are explicit strings (the AI writes them, not derived from acceptance_criteria).
+// acceptance_criteria remain on tasks for quality gates.
 const PLAN_SCHEMA = {
   type: 'object',
   properties: {
-    title: { type: 'string' },
+    title:    { type: 'string' },
     overview: { type: 'string' },
-    tasks: {
+    tracks: {
       type: 'array',
       items: {
         type: 'object',
         properties: {
-          title:                { type: 'string' },
-          description:          { type: 'string' },
-          feature_group:        { type: 'string' },
-          acceptance_criteria:  { type: 'array', items: { type: 'string' } },
-          depends_on_titles:    { type: 'array', items: { type: 'string' } },
-          assigned_agent:       { type: 'string', enum: ['AGENT_A', 'AGENT_B'] },
-          estimated_tokens_k:   { type: 'integer' },
-          session_window:       { type: 'integer' },
-          priority:             { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
-          is_checkpoint:        { type: 'boolean' },
-          test_commands:        { type: 'array', items: { type: 'string' } },
-          files_to_create:      { type: 'array', items: { type: 'string' } },
-          files_to_modify:      { type: 'array', items: { type: 'string' } },
+          title:          { type: 'string' },   // e.g. "Window 1 — Foundation"
+          session_window: { type: 'integer' },
+          features: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                title:       { type: 'string' },
+                description: { type: 'string' },
+                priority:    { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
+                tasks: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      title:               { type: 'string' },
+                      description:         { type: 'string' },
+                      subtasks:            { type: 'array', items: { type: 'string' } },
+                      acceptance_criteria: { type: 'array', items: { type: 'string' } },
+                      depends_on_titles:   { type: 'array', items: { type: 'string' } },
+                      assigned_agent:      { type: 'string', enum: ['AGENT_A', 'AGENT_B'] },
+                      estimated_tokens_k:  { type: 'integer' },
+                      priority:            { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
+                      is_checkpoint:       { type: 'boolean' },
+                      test_commands:       { type: 'array', items: { type: 'string' } },
+                      files_to_create:     { type: 'array', items: { type: 'string' } },
+                      files_to_modify:     { type: 'array', items: { type: 'string' } },
+                    },
+                    required: [
+                      'title', 'description', 'subtasks', 'acceptance_criteria',
+                      'depends_on_titles', 'assigned_agent', 'estimated_tokens_k',
+                      'priority', 'is_checkpoint', 'test_commands',
+                      'files_to_create', 'files_to_modify',
+                    ],
+                    additionalProperties: false,
+                  },
+                },
+              },
+              required: ['title', 'description', 'priority', 'tasks'],
+              additionalProperties: false,
+            },
+          },
         },
-        required: [
-          'title', 'description', 'feature_group', 'acceptance_criteria', 'depends_on_titles',
-          'assigned_agent', 'estimated_tokens_k', 'session_window',
-          'priority', 'is_checkpoint', 'test_commands', 'files_to_create', 'files_to_modify',
-        ],
+        required: ['title', 'session_window', 'features'],
         additionalProperties: false,
       },
     },
   },
-  required: ['title', 'overview', 'tasks'],
+  required: ['title', 'overview', 'tracks'],
   additionalProperties: false,
 }
 
@@ -118,28 +137,48 @@ ${openBugs || 'None'}
 RECENT SESSIONS:
 ${sessionSummaries || 'No sessions yet'}
 
-## Planning Requirements
+## Output Structure
 
-Think through this plan across these dimensions before writing it:
+Your plan is organized as a hierarchy: tracks → features → tasks → subtasks.
+You decide the shape based on what makes sense for the actual work.
+
+TRACKS group work into execution windows (~${SESSION_WINDOW_TOKENS_K}K tokens each). Think of each track as a sprint or session block. Some tracks are simple (1–2 features), others complex (4–6 features). Let the work dictate the size.
+
+FEATURES are meaningful logical areas within a track — "Auth Layer", "Database Schema", "Frontend Components", "Test Suite". A track will naturally have multiple features when the work spans different concerns. Name features after what they build, not just categories.
+
+TASKS are concrete implementation steps within a feature. A simple feature may have 2 tasks; a complex one may have 6+. Every feature needs at least one implementation task and one test task (TDD: test first). Add a CHECKPOINT task as the final task of every track's last feature.
+
+SUBTASKS are the granular steps an agent follows to complete a task. Be specific: exact file paths, function names, commands to run. Aim for 3–6 subtasks per task. Subtasks are how agents self-verify progress — make them actionable and checkable.
+
+## Planning Dimensions
+
+Think through this plan on all these axes before writing it:
 1. Feature decomposition — break every feature into atomic, independently-testable units
 2. Architecture decisions — data models, API contracts, component boundaries, state management
 3. Testing strategy — unit, integration, edge case tests per feature (TDD: test first)
 4. Risk analysis — hard parts, external dependencies, failure modes, defensive handling
-5. Session window planning — group tasks into 5-hour windows (~${SESSION_WINDOW_TOKENS_K}K tokens each), add a CHECKPOINT task at the end of every window
+5. Execution ordering — dependency chains across features and tracks; mark blockers explicitly in depends_on_titles
 
 ## Field Guidance
 
-- title: imperative verb phrase — "Implement X", "Write tests for Y", "Add Z"
+**Track:**
+- title: descriptive name that tells agents what this window accomplishes, e.g. "Window 1 — Schema & Auth Foundation"
+- session_window: 1-based integer; each window ~${SESSION_WINDOW_TOKENS_K}K tokens total
+
+**Feature:**
+- title: what is built, not a category label — "Guardian Auth Middleware" not "Authentication"
+- description: what this feature covers, why it's needed, its boundaries with adjacent features
+- priority: "critical" for blockers, "high" for core, "medium" for supporting, "low" for polish
+
+**Task:**
+- title: imperative verb phrase — "Implement X", "Write tests for Y", "Add Z middleware"
 - description: detailed — exact file paths, function signatures, data schemas, API contracts, edge cases. Minimum 4 sentences.
+- subtasks: step-by-step agent execution list; 3–6 items; each is a single checkable action
 - acceptance_criteria: specific, testable conditions verifiable by running a test or checking output
-- assigned_agent: "AGENT_A" for backend/DB/API/infra, "AGENT_B" for frontend/UI/components/styles
-- estimated_tokens_k (integer): 10-20 simple, 25-50 medium, 50-80 complex. Checkpoints always 10.
-- session_window (integer): 1-based grouping. Each window ~${SESSION_WINDOW_TOKENS_K}K total tokens. End every window with a CHECKPOINT task.
-- feature_group: Short label grouping related tasks within a window (e.g., "Auth Layer", "Database Schema", "UI Components", "Testing Suite"). Tasks with the same feature_group appear under the same Feature node on the project board. Every task must have one.
-- priority: "critical" blockers, "high" core features, "medium" enhancements, "low" polish
-- is_checkpoint: true ONLY for checkpoint/review tasks, false for all feature/test tasks
-- Generate at least 15 tasks total — be thorough, don't skip testing or edge-case handling
-- Every feature needs a corresponding test task (TDD structure)`
+- assigned_agent: "AGENT_A" for backend/DB/API/infra/testing; "AGENT_B" for frontend/UI/components/styles
+- estimated_tokens_k (integer): 10–20 simple, 25–50 medium, 50–80 complex; checkpoints always 10
+- is_checkpoint: true ONLY for checkpoint/review tasks that close a window; false for all implementation tasks
+- Generate at least 15 tasks total across all features — be thorough, don't skip testing or edge-case handling`
 
   const anthropic = getAnthropicClient()
 
@@ -169,7 +208,6 @@ Think through this plan across these dimensions before writing it:
   console.log('[generate-plan] stop_reason:', stopReason)
   console.log('[generate-plan] output_tokens:', response.usage?.output_tokens)
 
-  // Truncation means the JSON is incomplete — no point trying to parse it.
   if (stopReason === 'max_tokens') {
     console.error('[generate-plan] Response truncated — increase max_tokens')
     return NextResponse.json(
@@ -188,7 +226,6 @@ Think through this plan across these dimensions before writing it:
   try {
     planData = JSON.parse(rawText)
   } catch (parseErr) {
-    // With json_schema format this should never happen, but handle defensively.
     console.error('[generate-plan] JSON.parse failed (unexpected with json_schema):', parseErr)
     console.error('[generate-plan] Full rawText:', rawText.slice(0, 3000))
     return NextResponse.json(
@@ -197,71 +234,63 @@ Think through this plan across these dimensions before writing it:
     )
   }
 
-  if (!Array.isArray(planData?.tasks)) {
-    console.error('[generate-plan] planData.tasks is not an array. Keys:', Object.keys(planData ?? {}))
+  if (!Array.isArray(planData?.tracks)) {
+    console.error('[generate-plan] planData.tracks is not an array. Keys:', Object.keys(planData ?? {}))
     return NextResponse.json(
-      { error: 'Plan JSON missing tasks array', keys: Object.keys(planData ?? {}) },
+      { error: 'Plan JSON missing tracks array', keys: Object.keys(planData ?? {}) },
       { status: 500 }
     )
+  }
+
+  // Flatten all tasks across the tree for validation and dev_plan_tasks insertion
+  const allFlatTasks: Array<{ task: any; win: number; featureTitle: string }> = []
+  for (const track of planData.tracks) {
+    for (const feature of track.features ?? []) {
+      for (const task of feature.tasks ?? []) {
+        allFlatTasks.push({ task, win: track.session_window ?? 1, featureTitle: feature.title })
+      }
+    }
   }
 
   // ─── Sanity checks ────────────────────────────────────────────────────────────
-  // 1. Zero tasks — hard fail (always wrong)
-  if (planData.tasks.length === 0) {
+  if (allFlatTasks.length === 0) {
     console.error('[generate-plan] SANITY FAIL: 0 tasks returned')
     return NextResponse.json(
-      { error: 'Plan contains 0 tasks — the AI returned an empty task list. Try again with more project context in the Codebase Context field.' },
+      { error: 'Plan contains 0 tasks — the AI returned an empty task list. Try again with more project context.' },
       { status: 500 }
     )
   }
 
-  // 2. All tasks in same session window (no windowing applied)
-  const taskWindowSet = new Set(planData.tasks.map((t: any) => t.session_window ?? 1))
-  if (taskWindowSet.size === 1 && planData.tasks.length >= 8) {
-    console.warn('[generate-plan] SANITY WARN: all', planData.tasks.length, 'tasks in window 1 — no session windowing applied')
+  const windowSet = new Set(planData.tracks.map((t: any) => t.session_window ?? 1))
+  if (windowSet.size === 1 && allFlatTasks.length >= 8) {
+    console.warn('[generate-plan] SANITY WARN: all', allFlatTasks.length, 'tasks in window 1 — no session windowing applied')
   }
 
-  // 3. No checkpoint tasks (every windowed plan must have at least one)
-  if (planData.tasks.length >= 5 && !planData.tasks.some((t: any) => t.is_checkpoint === true)) {
-    console.warn('[generate-plan] SANITY WARN: no checkpoint tasks found in', planData.tasks.length, 'tasks')
+  if (allFlatTasks.length >= 5 && !allFlatTasks.some(({ task }) => task.is_checkpoint === true)) {
+    console.warn('[generate-plan] SANITY WARN: no checkpoint tasks found in', allFlatTasks.length, 'tasks')
   }
 
-  // 4. All tasks assigned to same agent (no AGENT_A / AGENT_B split)
-  const taskAgentSet = new Set(planData.tasks.map((t: any) => t.assigned_agent))
-  if (taskAgentSet.size === 1 && planData.tasks.length >= 5) {
-    console.warn('[generate-plan] SANITY WARN: all tasks assigned to single agent:', Array.from(taskAgentSet)[0])
-  }
-
-  // 5. All tasks have the same priority (no differentiation)
-  const taskPrioritySet = new Set(planData.tasks.map((t: any) => t.priority))
-  if (taskPrioritySet.size === 1 && planData.tasks.length >= 5) {
-    console.warn('[generate-plan] SANITY WARN: all tasks have same priority:', Array.from(taskPrioritySet)[0])
-  }
-
-  // 6. Duplicate task titles
   const titlesSeen = new Set<string>()
   const dupTitles: string[] = []
-  for (const t of planData.tasks) {
-    if (titlesSeen.has(t.title)) dupTitles.push(t.title)
-    titlesSeen.add(t.title)
+  for (const { task } of allFlatTasks) {
+    if (titlesSeen.has(task.title)) dupTitles.push(task.title)
+    titlesSeen.add(task.title)
   }
   if (dupTitles.length > 0) {
     console.warn('[generate-plan] SANITY WARN: duplicate task titles:', dupTitles)
   }
 
-  // 7. Thin tasks — short descriptions or missing acceptance criteria (>30% threshold)
-  const thinTasks = planData.tasks.filter(
-    (t: any) => !t.description || t.description.length < 30 || !t.acceptance_criteria?.length
+  const thinTasks = allFlatTasks.filter(
+    ({ task }) => !task.description || task.description.length < 30 || !task.acceptance_criteria?.length
   )
-  if (thinTasks.length > planData.tasks.length * 0.3) {
-    console.warn('[generate-plan] SANITY WARN:', thinTasks.length, 'of', planData.tasks.length, 'tasks have thin descriptions or no acceptance criteria')
+  if (thinTasks.length > allFlatTasks.length * 0.3) {
+    console.warn('[generate-plan] SANITY WARN:', thinTasks.length, 'of', allFlatTasks.length, 'tasks have thin descriptions')
   }
   // ─────────────────────────────────────────────────────────────────────────────
 
-  console.log('[generate-plan] Parsed successfully — tasks:', planData.tasks.length)
+  console.log('[generate-plan] Parsed successfully — tracks:', planData.tracks.length, 'tasks:', allFlatTasks.length)
 
-  // total_sessions_estimated: use reduce instead of spread to avoid stack issues on large arrays
-  const totalSessions = planData.tasks.reduce(
+  const totalSessions = planData.tracks.reduce(
     (max: number, t: any) => Math.max(max, t.session_window ?? 1),
     1
   )
@@ -283,11 +312,12 @@ Think through this plan across these dimensions before writing it:
     return NextResponse.json({ error: planError.message }, { status: 500 })
   }
 
+  // Insert flat tasks into dev_plan_tasks (for agent execution)
   const titleToId = new Map<string, string>()
   const insertedTasks: any[] = []
 
-  for (let i = 0; i < planData.tasks.length; i++) {
-    const t = planData.tasks[i]
+  for (let i = 0; i < allFlatTasks.length; i++) {
+    const { task: t, win } = allFlatTasks[i]
     const dependsOnIds = (t.depends_on_titles ?? [])
       .map((title: string) => titleToId.get(title))
       .filter(Boolean)
@@ -302,10 +332,9 @@ Think through this plan across these dimensions before writing it:
         depends_on: dependsOnIds,
         assigned_agent: t.assigned_agent ?? 'AGENT_A',
         estimated_tokens_k: t.estimated_tokens_k ?? 20,
-        session_window: t.session_window ?? 1,
+        session_window: win,
         position: i + 1,
         status: 'pending',
-        // migration 006 columns
         is_checkpoint: t.is_checkpoint ?? false,
         priority: t.priority ?? 'medium',
       })
@@ -321,13 +350,12 @@ Think through this plan across these dimensions before writing it:
     }
   }
 
-  // Sanity: if 0 tasks inserted but AI returned tasks, migration 006 is likely missing
-  if (insertedTasks.length === 0 && planData.tasks.length > 0) {
-    console.error('[generate-plan] SANITY FAIL: 0 of', planData.tasks.length, 'tasks inserted — migration 006 likely not applied')
+  if (insertedTasks.length === 0 && allFlatTasks.length > 0) {
+    console.error('[generate-plan] SANITY FAIL: 0 of', allFlatTasks.length, 'tasks inserted — migration 006 likely not applied')
     return NextResponse.json(
       {
-        error: `Plan generated (${planData.tasks.length} tasks) but none saved to database.\n\nRun migration 006 in Supabase SQL Editor:\n\nALTER TABLE dev_plan_tasks\n  ADD COLUMN IF NOT EXISTS is_checkpoint boolean NOT NULL DEFAULT false,\n  ADD COLUMN IF NOT EXISTS priority text NOT NULL DEFAULT 'medium'\n    CHECK (priority IN ('critical','high','medium','low'));`,
-        taskCount: planData.tasks.length,
+        error: `Plan generated (${allFlatTasks.length} tasks) but none saved to database.\n\nRun migration 006 in Supabase SQL Editor:\n\nALTER TABLE dev_plan_tasks\n  ADD COLUMN IF NOT EXISTS is_checkpoint boolean NOT NULL DEFAULT false,\n  ADD COLUMN IF NOT EXISTS priority text NOT NULL DEFAULT 'medium'\n    CHECK (priority IN ('critical','high','medium','low'));`,
+        taskCount: allFlatTasks.length,
         insertedCount: 0,
       },
       { status: 500 }
@@ -340,26 +368,22 @@ Think through this plan across these dimensions before writing it:
     .update({ health: 'on-track', updated_at: new Date().toISOString() })
     .eq('id', projectId)
 
-  // Auto-populate pm_items: Track → Feature → Task → Subtask (4-level hierarchy).
-  // Best-effort — migration 005 must be run; failure here doesn't affect the plan save.
+  // Auto-populate pm_items from the AI-designed nested hierarchy.
+  // The tree shape is exactly what the AI produced — no mechanical remapping.
+  // Best-effort: failure here doesn't affect the plan save.
   try {
-    const windowNums = Array.from(
-      new Set(planData.tasks.map((t: any) => t.session_window ?? 1))
-    ).sort((a: any, b: any) => a - b) as number[]
-
-    for (const win of windowNums) {
-      const winTasks = planData.tasks.filter((t: any) => (t.session_window ?? 1) === win)
+    for (const track of planData.tracks) {
+      const win: number = track.session_window ?? 1
       const trackPos = win * 10000
 
-      // Level 1: Track (one per session window)
-      const { data: track, error: trackError } = await user.supabase
+      const { data: trackItem, error: trackError } = await user.supabase
         .from('pm_items')
         .insert({
           project_id: projectId,
           parent_id: null,
           level: 'track',
-          title: `Session Window ${win}`,
-          description: `Auto-generated from dev plan: ${devPlan.title}`,
+          title: track.title,
+          description: `Session window ${win} — ${devPlan.title}`,
           status: 'backlog',
           priority: 'medium',
           position: trackPos,
@@ -368,40 +392,31 @@ Think through this plan across these dimensions before writing it:
         .select()
         .single()
 
-      if (trackError) {
+      if (trackError || !trackItem) {
         console.error(`[generate-plan] pm_items track insert error (window ${win}):`, trackError)
         continue
       }
-      if (!track) continue
 
-      // Group tasks by feature_group (preserve insertion order of first occurrence)
-      const featureOrder: string[] = []
-      const featureGroups = new Map<string, any[]>()
-      for (const t of winTasks) {
-        const fg: string = (t.feature_group as string | undefined) || 'General'
-        if (!featureGroups.has(fg)) { featureGroups.set(fg, []); featureOrder.push(fg) }
-        featureGroups.get(fg)!.push(t)
-      }
+      const features: any[] = track.features ?? []
+      for (let fi = 0; fi < features.length; fi++) {
+        const feature = features[fi]
+        const featurePos = trackPos + (fi + 1) * 1000
 
-      let fIdx = 0
-      for (const groupName of featureOrder) {
-        fIdx++
-        const groupTasks: any[] = featureGroups.get(groupName)!
-        const featurePos = trackPos + fIdx * 1000
+        const featureTasks: any[] = feature.tasks ?? []
+        const topPriority = featureTasks.some((t: any) => t.priority === 'critical') ? 'critical'
+          : featureTasks.some((t: any) => t.priority === 'high') ? 'high' : (feature.priority ?? 'medium')
+        const featureAgents = Array.from(
+          new Set(featureTasks.map((t: any) => t.assigned_agent).filter(Boolean))
+        )
 
-        // Level 2: Feature (one per feature_group)
-        const topPriority = groupTasks.some((t: any) => t.priority === 'critical') ? 'critical'
-          : groupTasks.some((t: any) => t.priority === 'high') ? 'high' : 'medium'
-        const featureAgents = Array.from(new Set(groupTasks.map((t: any) => t.assigned_agent).filter(Boolean)))
-
-        const { data: feature, error: featureError } = await user.supabase
+        const { data: featureItem, error: featureError } = await user.supabase
           .from('pm_items')
           .insert({
             project_id: projectId,
-            parent_id: track.id,
+            parent_id: trackItem.id,
             level: 'feature',
-            title: groupName,
-            description: null,
+            title: feature.title,
+            description: feature.description ?? null,
             status: 'backlog',
             priority: topPriority,
             position: featurePos,
@@ -412,22 +427,20 @@ Think through this plan across these dimensions before writing it:
           .select()
           .single()
 
-        if (featureError) {
-          console.error(`[generate-plan] pm_items feature insert error (win ${win}, group "${groupName}"):`, featureError)
+        if (featureError || !featureItem) {
+          console.error(`[generate-plan] pm_items feature insert error (win ${win}, feature "${feature.title}"):`, featureError)
           continue
         }
-        if (!feature) continue
 
-        for (let ti = 0; ti < groupTasks.length; ti++) {
-          const t = groupTasks[ti]
+        for (let ti = 0; ti < featureTasks.length; ti++) {
+          const t = featureTasks[ti]
           const taskPos = featurePos + (ti + 1) * 100
 
-          // Level 3: Task (one per plan task)
           const { data: taskItem, error: taskError } = await user.supabase
             .from('pm_items')
             .insert({
               project_id: projectId,
-              parent_id: feature.id,
+              parent_id: featureItem.id,
               level: 'task',
               title: t.title,
               description: t.description ?? null,
@@ -437,36 +450,35 @@ Think through this plan across these dimensions before writing it:
               assigned_agents: t.assigned_agent ? [t.assigned_agent] : [],
               acceptance_criteria: t.acceptance_criteria ?? [],
               estimated_tokens_k: t.estimated_tokens_k ?? null,
-              session_window: t.session_window ?? win,
+              session_window: win,
               tags: t.is_checkpoint ? ['checkpoint'] : [],
             })
             .select()
             .single()
 
-          if (taskError) {
+          if (taskError || !taskItem) {
             console.error(`[generate-plan] pm_items task insert error (win ${win}, task ${ti}):`, taskError)
             continue
           }
-          if (!taskItem) continue
 
-          // Level 4: Subtasks from acceptance_criteria (max 6 per task)
-          const criteria: string[] = t.acceptance_criteria ?? []
-          for (let ci = 0; ci < Math.min(criteria.length, 6); ci++) {
+          // Insert subtasks as written by the AI (not derived from acceptance_criteria)
+          const subtasks: string[] = t.subtasks ?? []
+          for (let si = 0; si < subtasks.length; si++) {
             const { error: subError } = await user.supabase.from('pm_items').insert({
               project_id: projectId,
               parent_id: taskItem.id,
               level: 'subtask',
-              title: criteria[ci],
+              title: subtasks[si],
               description: null,
               status: 'backlog',
               priority: 'medium',
-              position: taskPos + (ci + 1),
+              position: taskPos + si + 1,
               assigned_agents: t.assigned_agent ? [t.assigned_agent] : [],
               acceptance_criteria: [],
               tags: [],
             })
             if (subError) {
-              console.error(`[generate-plan] pm_items subtask insert error (task ${taskItem.id}, criteria ${ci}):`, subError)
+              console.error(`[generate-plan] pm_items subtask insert error (task ${taskItem.id}, subtask ${si}):`, subError)
             }
           }
         }
