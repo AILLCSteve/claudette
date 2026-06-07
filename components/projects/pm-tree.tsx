@@ -6,7 +6,7 @@ import {
   ChevronRight, ChevronDown, Plus, Pencil, Trash2, X, Check,
   UserPlus, Zap, Circle, CheckCircle2, AlertCircle, Ban, Clock,
   Pause, Eye, MessageSquare, GitMerge, Loader2, CalendarDays,
-  Layers, LayoutList, Target
+  Layers, LayoutList, Target, RefreshCw
 } from 'lucide-react'
 
 // ── Types ─────────────────────────────────────────────────────────────────
@@ -38,15 +38,16 @@ interface TreeNode extends PmItem { children: TreeNode[] }
 // ── Status system ─────────────────────────────────────────────────────────
 
 export const STATUSES: { value: string; label: string; color: string; pill: string; icon: React.ReactNode; group: string }[] = [
-  { value: 'backlog',           label: 'Backlog',            color: 'text-muted-foreground/50', pill: 'bg-muted/20 border-border/30',              icon: <Circle className="h-3 w-3" />,          group: 'Planning' },
-  { value: 'not-started',      label: 'Not Started',        color: 'text-muted-foreground/70', pill: 'bg-muted/30 border-border/40',              icon: <Circle className="h-3 w-3" />,          group: 'Planning' },
+  { value: 'backlog',           label: 'Backlog',            color: 'text-muted-foreground/40', pill: 'bg-muted/15 border-border/25',              icon: <Circle className="h-3 w-3" />,          group: 'Planning' },
+  { value: 'not-started',      label: 'Not Yet Started',    color: 'text-muted-foreground/70', pill: 'bg-muted/30 border-border/40',              icon: <Clock className="h-3 w-3" />,           group: 'Planning' },
   { value: 'ready',            label: 'Ready',              color: 'text-blue-400',            pill: 'bg-blue-500/10 border-blue-500/25',         icon: <Target className="h-3 w-3" />,          group: 'Planning' },
   { value: 'in-progress',      label: 'In Progress',        color: 'text-violet-400',          pill: 'bg-violet-500/15 border-violet-500/30',     icon: <Zap className="h-3 w-3" />,             group: 'Active' },
   { value: 'underway',         label: 'Underway',           color: 'text-violet-300',          pill: 'bg-violet-500/10 border-violet-500/20',     icon: <Zap className="h-3 w-3" />,             group: 'Active' },
   { value: 'paused',           label: 'Paused',             color: 'text-yellow-500',          pill: 'bg-yellow-500/10 border-yellow-500/25',     icon: <Pause className="h-3 w-3" />,           group: 'Active' },
-  { value: 'blocked',          label: 'Blocked',            color: 'text-red-400',             pill: 'bg-red-500/15 border-red-500/30',           icon: <AlertCircle className="h-3 w-3" />,     group: 'Blocked' },
-  { value: 'awaiting-decision',label: 'Awaiting Decision',  color: 'text-orange-400',          pill: 'bg-orange-500/10 border-orange-500/25',     icon: <MessageSquare className="h-3 w-3" />,   group: 'Blocked' },
-  { value: 'needs-input',      label: 'Needs Input',        color: 'text-orange-300',          pill: 'bg-orange-500/8 border-orange-500/20',      icon: <MessageSquare className="h-3 w-3" />,   group: 'Blocked' },
+  { value: 'needs-attention',  label: 'Needs Attention',    color: 'text-amber-400',           pill: 'bg-amber-500/15 border-amber-500/30',       icon: <AlertCircle className="h-3 w-3" />,     group: 'Attention' },
+  { value: 'awaiting-decision',label: 'Awaiting Decision',  color: 'text-orange-400',          pill: 'bg-orange-500/10 border-orange-500/25',     icon: <MessageSquare className="h-3 w-3" />,   group: 'Attention' },
+  { value: 'blocked',          label: 'Blocked',            color: 'text-red-400',             pill: 'bg-red-500/15 border-red-500/30',           icon: <Ban className="h-3 w-3" />,             group: 'Attention' },
+  { value: 'needs-input',      label: 'Needs Input',        color: 'text-orange-300',          pill: 'bg-orange-500/8 border-orange-500/20',      icon: <MessageSquare className="h-3 w-3" />,   group: 'Attention' },
   { value: 'in-review',        label: 'In Review',          color: 'text-cyan-400',            pill: 'bg-cyan-500/10 border-cyan-500/25',         icon: <Eye className="h-3 w-3" />,             group: 'Review' },
   { value: 'testing',          label: 'Testing',            color: 'text-cyan-300',            pill: 'bg-cyan-500/8 border-cyan-500/20',          icon: <GitMerge className="h-3 w-3" />,        group: 'Review' },
   { value: 'done',             label: 'Done',               color: 'text-emerald-400',         pill: 'bg-emerald-500/15 border-emerald-500/30',   icon: <CheckCircle2 className="h-3 w-3" />,    group: 'Complete' },
@@ -617,13 +618,31 @@ export function PmTree({ projectId }: { projectId: string }) {
   const [addingUnder, setAddingUnder] = useState<{ parentId: string; level: Level } | null>(null)
   const [addingTrack, setAddingTrack] = useState(false)
   const [agents] = useState<string[]>(DEFAULT_AGENTS)
+  const [syncing, setSyncing] = useState(false)
 
-  useEffect(() => {
+  const loadItems = useCallback(() => {
+    setLoading(true)
     fetch(`/api/pm-items?project_id=${projectId}`)
       .then(r => r.json())
       .then(d => { setItems(Array.isArray(d) ? d : []); setLoading(false) })
       .catch(() => setLoading(false))
   }, [projectId])
+
+  useEffect(() => { loadItems() }, [loadItems])
+
+  const syncFromPlan = useCallback(async () => {
+    setSyncing(true)
+    try {
+      await fetch(`/api/pm-items/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: projectId }),
+      })
+      loadItems()
+    } finally {
+      setSyncing(false)
+    }
+  }, [projectId, loadItems])
 
   const tree = buildTree(items)
   const selectedItem = selectedId ? items.find(i => i.id === selectedId) ?? null : null
@@ -718,6 +737,12 @@ export function PmTree({ projectId }: { projectId: string }) {
           <Button size="sm" variant="ghost" className="text-xs h-7 gap-1"
             onClick={() => setExpanded(new Set())}>
             Collapse
+          </Button>
+          <Button size="sm" variant="outline" className="text-xs h-7 gap-1.5"
+            onClick={syncFromPlan} disabled={syncing}
+            title="Pull latest task statuses from the dev plan into the board">
+            <RefreshCw className={`h-3.5 w-3.5 ${syncing ? 'animate-spin' : ''}`} />
+            {syncing ? 'Syncing…' : 'Sync Plan'}
           </Button>
           <Button size="sm" className="text-xs h-7 gap-1.5"
             onClick={() => setAddingTrack(true)}>
