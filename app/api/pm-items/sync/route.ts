@@ -1,4 +1,5 @@
 import { getRequestUser } from '@/lib/auth/api-auth'
+import { rollupAll } from '@/lib/pm/rollup'
 import { NextResponse } from 'next/server'
 
 // Map dev_plan_tasks status → pm_items status
@@ -81,6 +82,10 @@ export async function POST(request: Request) {
 
     if (!error) synced++
   }
+
+  // Roll up all parent statuses bottom-up now that leaf statuses are correct.
+  // This ensures windows/features reflect the state of their tasks.
+  await rollupAll(user.supabase, project_id)
 
   return NextResponse.json({ synced, total: devTasks.length })
 }

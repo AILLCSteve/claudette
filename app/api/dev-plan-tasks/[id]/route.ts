@@ -1,4 +1,5 @@
 import { getRequestUser } from '@/lib/auth/api-auth'
+import { rollupAncestors } from '@/lib/pm/rollup'
 import { NextResponse } from 'next/server'
 
 const VALID_STATUSES = ['pending', 'in-progress', 'done', 'blocked', 'skipped']
@@ -109,6 +110,9 @@ export async function PATCH(request: Request, { params }: { params: { id: string
           .from('pm_items')
           .update(pmUpdate)
           .eq('id', pmItem.id)
+
+        // Roll up parent statuses after each task update (fire-and-forget)
+        rollupAncestors(user.supabase, pmItem.id, plan.project_id).catch(() => {})
       }
     }
   }
